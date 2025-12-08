@@ -1,2 +1,6 @@
-# Arc-vQuick
-A quick prototype of Arc, please don't mind.
+# Arc
+
+A tiny scripting language with print, variables, if/else, and while loops.
+
+## Run
+python arc.py
