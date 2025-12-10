@@ -1,115 +1,230 @@
-import re
 import sys
 
-variables = {}
+# ========================================================
+# AST NODES
+# ========================================================
 
-def evaluate(expr):
-    """Evaluates numbers, variables, and math expressions."""
-    expr = expr.strip()
+class AST_Target:
+    def __init__(self, lang, filename):
+        self.lang = lang
+        self.filename = filename
 
-    # If it's quoted, treat as string literal
-    if (expr.startswith('"') and expr.endswith('"')):
-        return expr.strip('"')
+class AST_Assign:
+    def __init__(self, name, value):
+        self.name = name
+        self.value = value
 
-    # If it's a standalone variable
-    if expr in variables:
-        return variables[expr]
+class AST_Echo:
+    def __init__(self, value):
+        self.value = value
 
-    try:
-        return eval(expr, {}, variables)
-    except:
-        return expr
-
-
-def execute_single(cmd):
-    """Executes one Arc command (no multi-statements)."""
-    tokens = cmd.split()
-
-    if not tokens:
-        return False
-
-    # PRINT
-    if tokens[0] == "print":
-        parts = cmd[6:].strip().split()
-        print(*[evaluate(p) for p in parts])
-
-    # VARIABLE ASSIGNMENT
-    elif tokens[0] == "var":
-        var_name = tokens[1]
-        expr = cmd.split("=", 1)[1].strip()
-        variables[var_name] = evaluate(expr)
-
-    # IF
-    elif tokens[0] == "if":
-        condition, body = cmd.split(":", 1)
-        condition = condition[3:].strip()
-        if eval(condition, {}, variables):
-            execute_line(body.strip())
-            return True
-        return False
-
-    # ELSE
-    elif tokens[0] == "else":
-        body = cmd.split(":", 1)[1].strip()
-        execute_line(body)
-
-    # WHILE
-    elif tokens[0] == "while":
-        condition, body = cmd.split(":", 1)
-        condition = condition[6:].strip()
-        body = body.strip()
-
-        while eval(condition, {}, variables):
-            execute_line(body)
-
-    return False
+class AST_Inline:
+    def __init__(self, lang, code):
+        self.lang = lang
+        self.code = code
 
 
-def execute_line(line, skip_else=False):
-    """Supports multiple commands on the same line."""
-    # Split on commands inside a single line
-    parts = re.split(r'\b(?=print|var|if|else|while\b)', line)
+# ========================================================
+# BRACE FIXER (SMART INLINE MODE) 😭🔥
+# ========================================================
 
-    for p in parts:
-        p = p.strip()
-        if not p:
+def balance_braces(code):
+    """
+    Automatically fixes missing closing braces in inline C blocks.
+    Also returns warnings if things look sus.
+    """
+    text = code.split("\n")
+    open_braces = 0
+
+    for line in text:
+        open_braces += line.count("{")
+        open_braces -= line.count("}")
+
+    warnings = []
+
+    if open_braces > 0:
+        warnings.append(f"[Arc Warning] Inline block missing {open_braces} closing brace(s). Auto-fixing.")
+        text.append("}" * open_braces)
+
+    if open_braces < 0:
+        warnings.append("[Arc Warning] More closing braces than opening braces. Code may break.")
+
+    return "\n".join(text), warnings
+
+
+# ========================================================
+# PARSER (super robust)
+# ========================================================
+
+def parse(lines):
+    ast = []
+    inline_mode = False
+    inline_lang = None
+    inline_buffer = []
+
+    for raw in lines:
+        line = raw.strip()
+
+        if not line or line.startswith("#"):
             continue
 
-        if p.startswith("else") and skip_else:
+        # start inline block
+        if not inline_mode and line.startswith("inline_") and line.endswith("{"):
+            inline_lang = line.split("_", 1)[1].split("{")[0].strip()
+            inline_mode = True
+            inline_buffer = []
             continue
 
-        result = execute_single(p)
+        # end inline block
+        if inline_mode and line == "}":
+            fixed_code, warns = balance_braces("\n".join(inline_buffer))
+            for w in warns:
+                print(w)
+            ast.append(AST_Inline(inline_lang, fixed_code))
+            inline_mode = False
+            inline_lang = None
+            inline_buffer = []
+            continue
 
-        # result=True means IF executed successfully
-        if p.startswith("if"):
-            skip_else = result
+        # inside inline
+        if inline_mode:
+            inline_buffer.append(raw.rstrip("\n"))
+            continue
 
-    return skip_else
+        # target
+        if line.startswith("tp "):
+            parts = line.split()
+            if len(parts) != 4:
+                raise Exception("Invalid tp syntax.")
+            _, lang, _, filename = parts
+            ast.append(AST_Target(lang, filename))
+            continue
+
+        # echo
+        if line.startswith("echo "):
+            ast.append(AST_Echo(line[5:].strip()))
+            continue
+
+        # variable assign: x 10
+        parts = line.split(maxsplit=1)
+        if len(parts) == 2:
+            ast.append(AST_Assign(parts[0], parts[1]))
+            continue
+
+        # ignore stray brace
+        if line == "}":
+            continue
+
+        raise Exception("Unknown syntax: " + line)
+
+    return ast
 
 
-def run_arc_tests():
-    print("Running Arc Self-Test...\n")
+# ========================================================
+# BACKEND: PYTHON
+# ========================================================
 
-    test_code = [
-        'print "Test 1: Printing works!"',
-        'var x = 10',
-        'print "x =" x',
-        'if x > 5: print "IF works!"',
-        'else: print "IF FAILED"',
-        'var y = 1',
-        'while y < 4: print "Loop:" y var y = y + 1',
-        'print "Final y =" y'
-    ]
+def emit_python(ast):
+    out = []
 
-    global variables
-    variables = {}
+    for node in ast:
+        if isinstance(node, AST_Assign):
+            out.append(f"{node.name} = {node.value}")
 
-    for line in test_code:
-        print(">>", line)
-        execute_line(line)
+        elif isinstance(node, AST_Echo):
+            out.append(f"print({node.value})")
 
-    print("\nArc Self-Test Complete.")
+        elif isinstance(node, AST_Inline):
+            out.append("# inline block ignored")
+            for ln in node.code.split("\n"):
+                out.append("# " + ln)
 
+    return "\n".join(out)
+
+
+# ========================================================
+# BACKEND: C (smart printing + brace fixer)
+# ========================================================
+
+def emit_c(ast):
+    out = ["#include <stdio.h>\n"]
+
+    var_types = {}  # track string/int
+
+    for node in ast:
+        if isinstance(node, AST_Assign):
+            val = node.value
+
+            if val.startswith('"') and val.endswith('"'):
+                var_types[node.name] = "string"
+                out.append(f'char* {node.name} = {val};')
+            else:
+                var_types[node.name] = "int"
+                out.append(f'int {node.name} = {val};')
+
+        elif isinstance(node, AST_Echo):
+            val = node.value
+
+            # literal string
+            if val.startswith('"') and val.endswith('"'):
+                out.append(f'printf("%s\\n", {val});')
+                continue
+
+            # known variable
+            if val in var_types:
+                if var_types[val] == "string":
+                    out.append(f'printf("%s\\n", {val});')
+                else:
+                    out.append(f'printf("%d\\n", {val});')
+                continue
+
+            # fallback
+            out.append(f'printf("%d\\n", {val});')
+
+        elif isinstance(node, AST_Inline):
+            out.append(node.code)
+
+    return "\n".join(out)
+
+
+# ========================================================
+# BUILD SYSTEM
+# ========================================================
+
+def build(ast):
+    target = None
+    for node in ast:
+        if isinstance(node, AST_Target):
+            target = node
+            break
+
+    if not target:
+        raise Exception("Missing target: tp C as out.c")
+
+    if target.lang == "Py":
+        code = emit_python(ast)
+    elif target.lang == "C":
+        code = emit_c(ast)
+    else:
+        raise Exception("Unknown backend: " + target.lang)
+
+    with open(target.filename, "w") as f:
+        f.write(code)
+
+    print("Generated →", target.filename)
+
+
+# ========================================================
+# CLI
+# ========================================================
 
 if __name__ == "__main__":
-    run_arc_tests()
+    if len(sys.argv) != 2:
+        print("usage: python arc.py file.arc")
+        sys.exit(1)
+
+    with open(sys.argv[1], "r") as f:
+        lines = f.readlines()
+
+    ast = parse(lines)
+    build(ast)
